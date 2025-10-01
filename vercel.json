@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "functions": {
+    "api/run-humai.ts": {
+      "runtime": "edge"
+    },
+    "api/ingest.ts": {
+      "runtime": "edge"
+    }
+  }
+}
