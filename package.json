@@ -1,5 +1,1 @@
-{
-  "name": "bpm-humai-runner",
-  "private": true,
-  "version": "1.0.0"
-}
+{ "name": "bpm-humai-runner", "private": true, "version": "1.0.0" }
