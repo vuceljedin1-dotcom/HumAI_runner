@@ -1,3 +1,21 @@
+export const config = { runtime: "edge" };
+
+function present(name){ return !!process.env[name]; }
+
+export default async function handler(req) {
+  const url = new URL(req.url);
+  if (url.searchParams.get("diag") === "1") {
+    return new Response(JSON.stringify({
+      ok: true,
+      env_present: {
+        EDGE_SHARED_SECRET: present("EDGE_SHARED_SECRET"),
+        SUPABASE_URL: present("SUPABASE_URL"),
+        SUPABASE_SERVICE_ROLE_KEY: present("SUPABASE_SERVICE_ROLE_KEY"),
+        HYPERSTACK_API_URL: present("HYPERSTACK_API_URL"),
+        HYPERSTACK_API_KEY: present("HYPERSTACK_API_KEY")
+      }
+    }), { headers: { "content-type": "application/json" }});
+  }
 // api/run-humai.js
 export const config = { runtime: "edge" };
 
