@@ -1,175 +1,155 @@
-export const config = { runtime: "edge" };
+// api/run-humai.ts
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { createClient } from '@supabase/supabase-js';
 
-function present(name){ return !!process.env[name]; }
+/** ---- Env guard ---- */
+const {
+  NEXT_PUBLIC_SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  EDGE_SHARED_SECRET,
+  HYPERSTACK_API_KEY,
+  HYPERSTACK_MODEL,
+} = process.env;
 
-export default async function handler(req) {
-  const url = new URL(req.url);
-  if (url.searchParams.get("diag") === "1") {
-    return new Response(JSON.stringify({
-      ok: true,
-      env_present: {
-        EDGE_SHARED_SECRET: present("EDGE_SHARED_SECRET"),
-        SUPABASE_URL: present("SUPABASE_URL"),
-        SUPABASE_SERVICE_ROLE_KEY: present("SUPABASE_SERVICE_ROLE_KEY"),
-        HYPERSTACK_API_URL: present("HYPERSTACK_API_URL"),
-        HYPERSTACK_API_KEY: present("HYPERSTACK_API_KEY")
-      }
-    }), { headers: { "content-type": "application/json" }});
-  }
-// api/run-humai.js
-export const config = { runtime: "edge" };
+function missing(...keys: string[]) {
+  const miss = keys.filter((k) => !(process.env as any)[k]);
+  return miss.length ? miss : null;
+}
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
+const miss = missing(
+  'NEXT_PUBLIC_SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'EDGE_SHARED_SECRET',
+  'HYPERSTACK_API_KEY',
+  'HYPERSTACK_MODEL'
+);
+if (miss) {
+  // Log u build/runtime; korisniku vraćamo 500 kasnije.
+  console.error('Missing env:', miss.join(', '));
+}
+
+/** ---- Supabase (service role) ---- */
+const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!, {
+  auth: { persistSession: false },
+});
+
+/** ---- Helpers ---- */
+function json(res: VercelResponse, code: number, payload: any) {
+  return res.status(code).json(payload);
+}
+
+function unauthorized(res: VercelResponse, msg = 'Unauthorized') {
+  return json(res, 401, { ok: false, error: msg });
+}
+
+/** ---- Hyperstack call ---- */
+async function callHyperstack(intake: any, last_log: any, sensors: any[]) {
+  // Minimalan, striktan system prompt (model već istreniran na širi kontrakt)
+  const system = `You are HumAI. Return STRICT JSON only according to the contract already trained.`;
+  const user = JSON.stringify({ intake, last_log, sensors });
+
+  const resp = await fetch('https://console.hyperstack.cloud/ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${HYPERSTACK_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: HYPERSTACK_MODEL,
+      stream: false,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
   });
-}
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
-
-function authOk(req) {
-  const expected = `Bearer ${requireEnv("EDGE_SHARED_SECRET")}`;
-  const got = req.headers.get("authorization") || "";
-  return got === expected;
-}
-
-function enc(v) {
-  return encodeURIComponent(v);
-}
-
-export default async function handler(req) {
+  const raw = await resp.text();
   try {
-    if (req.method === "OPTIONS") return new Response("ok");
-
-    // 1) Auth
-    if (!authOk(req)) return json({ ok: false, error: "Unauthorized" }, 401);
-
-    // 2) Body (Supabase trigger ili ručni cURL)
-    const { table, op, row } = await req.json();
-
-    // podržavamo ova 3 stola; ostalo preskačemo
-    if (!["intake_forms", "daily_logs", "sensor_events"].includes(table)) {
-      return json({ ok: true, skip: true, table, op });
+    const parsed = JSON.parse(raw);
+    // Ako Hyperstack vrati direktno JSON plana (kako si testirao u Playgroundu)
+    // parsed je već naš plan objekt. U nekim slučajevima API vraća {choices:[{message:{content:"<json>"}}]}
+    if (parsed?.choices?.[0]?.message?.content) {
+      return JSON.parse(parsed.choices[0].message.content);
     }
-
-    const user_id = row && row.user_id;
-    if (!user_id) return json({ ok: true, note: "no user_id" });
-
-    // 3) Supabase admin REST (Service Role!)
-    const SUPABASE_URL = requireEnv("SUPABASE_URL").replace(/\/+$/, "");
-    const SERVICE_ROLE = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
-    const sHeaders = {
-      apikey: SERVICE_ROLE,
-      Authorization: `Bearer ${SERVICE_ROLE}`,
-      "Content-Type": "application/json",
-    };
-
-    // 4) Učitaj kontekst: intake (zadnji), last_log (zadnji), senzori (24h)
-    const [intakeRes, lastLogRes] = await Promise.all([
-      fetch(
-        `${SUPABASE_URL}/rest/v1/intake_forms?user_id=eq.${enc(
-          user_id
-        )}&select=*&order=created_at.desc&limit=1`,
-        { headers: sHeaders }
-      ),
-      fetch(
-        `${SUPABASE_URL}/rest/v1/daily_logs?user_id=eq.${enc(
-          user_id
-        )}&select=*&order=date.desc&limit=1`,
-        { headers: sHeaders }
-      ),
-    ]);
-
-    if (!intakeRes.ok) {
-      return json(
-        { ok: false, error: `intake_forms ${intakeRes.status}: ${await intakeRes.text()}` },
-        500
-      );
-    }
-    if (!lastLogRes.ok) {
-      return json(
-        { ok: false, error: `daily_logs ${lastLogRes.status}: ${await lastLogRes.text()}` },
-        500
-      );
-    }
-
-    const [intake] = await intakeRes.json();
-    const [last_log] = await lastLogRes.json();
-
-    const sinceISO = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-    const sensorsRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/sensor_events?user_id=eq.${enc(
-        user_id
-      )}&occurred_at=gte.${enc(sinceISO)}&select=*&order=occurred_at.desc`,
-      { headers: sHeaders }
-    );
-    if (!sensorsRes.ok) {
-      return json(
-        { ok: false, error: `sensor_events ${sensorsRes.status}: ${await sensorsRes.text()}` },
-        500
-      );
-    }
-    const sensors = await sensorsRes.json();
-
-    // 5) Hyperstack poziv
-    const HYPERSTACK_API_URL = requireEnv("HYPERSTACK_API_URL");
-    const HYPERSTACK_API_KEY = requireEnv("HYPERSTACK_API_KEY");
-
-    const hsPayload = {
-      user_id,
-      intake: (intake && intake.payload) || {},
-      last_log: last_log || {},
-      sensors: sensors || [],
-      need: "generate_next_plan",
-    };
-
-    const hsRes = await fetch(HYPERSTACK_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${HYPERSTACK_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(hsPayload),
-    });
-
-    if (!hsRes.ok) {
-      const err = await hsRes.text();
-      return json({ ok: false, error: `Hyperstack ${hsRes.status}: ${err}` }, 502);
-    }
-
-    const planJson = await hsRes.json();
-    const plan_date =
-      (planJson && planJson.plan_date) || new Date().toISOString().slice(0, 10);
-
-    // 6) Insert u public.plans
-    const insRes = await fetch(`${SUPABASE_URL}/rest/v1/plans`, {
-      method: "POST",
-      headers: sHeaders,
-      body: JSON.stringify([{ user_id, plan_date, plan: planJson, source: "hyperstack" }]),
-    });
-
-    if (!insRes.ok) {
-      const err = await insRes.text();
-      return json({ ok: false, error: `Insert plans ${insRes.status}: ${err}` }, 500);
-    }
-
-    // 7) (opciono) award → credentials
-    const award = planJson && planJson.effort_status && planJson.effort_status.award;
-    if (award) {
-      await fetch(`${SUPABASE_URL}/rest/v1/credentials`, {
-        method: "POST",
-        headers: sHeaders,
-        body: JSON.stringify([{ user_id, name: award, meta: planJson.effort_status || null }]),
-      });
-    }
-
-    return json({ ok: true });
+    return parsed;
   } catch (e) {
-    return json({ ok: false, error: String(e && e.message ? e.message : e) }, 500);
+    throw new Error(`Hyperstack parse error: ${raw.slice(0, 400)}`);
+  }
+}
+
+/** ---- Main handler ---- */
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Health-check / GET
+  if (req.method === 'GET') {
+    return json(res, 200, { ok: true, service: 'humai-runner', time: new Date().toISOString() });
+  }
+
+  if (req.method !== 'POST') {
+    return json(res, 405, { ok: false, error: 'Method Not Allowed' });
+  }
+
+  if (miss) {
+    return json(res, 500, { ok: false, error: `Missing env: ${miss.join(', ')}` });
+  }
+
+  // Bearer auth (EDGE_SHARED_SECRET)
+  const auth = req.headers['authorization'] || req.headers['Authorization'];
+  if (!auth || typeof auth !== 'string' || !auth.startsWith('Bearer ')) {
+    return unauthorized(res, 'Missing Bearer token');
+  }
+  const token = auth.slice('Bearer '.length).trim();
+  if (token !== EDGE_SHARED_SECRET) {
+    return unauthorized(res, 'Invalid secret');
+  }
+
+  // Parse body (Postman / Supabase webhook šalju JSON)
+  let body: any;
+  try {
+    body = typeof req.body === 'object' ? req.body : JSON.parse(req.body || '{}');
+  } catch {
+    return json(res, 400, { ok: false, error: 'Bad JSON body' });
+  }
+
+  const { table, op, row } = body || {};
+  if (!table || !op || !row) {
+    return json(res, 400, { ok: false, error: 'Expected {table, op, row}' });
+  }
+
+  try {
+    // 1) Intake event -> generiši plan preko Hyperstack-a
+    if (table === 'intake_forms' && String(op).toUpperCase() === 'INSERT') {
+      const user_id = row.user_id;
+      const intake = row.payload || {};
+      const last_log = {}; // možeš dopuniti čitanjem iz Supabase ako želiš
+      const sensors: any[] = []; // isto
+
+      const plan = await callHyperstack(intake, last_log, sensors);
+
+      // Očekuje se JSON sa ključevima: plan_date, daily_plan, training_recs, nutrition_plan, effort_status
+      // Upis u public.plans (payload = cijeli plan)
+      const { error } = await supabase
+        .from('plans')
+        .insert({
+          user_id,
+          plan_date: plan.plan_date, // YYYY-MM-DD
+          payload: plan,             // full JSON
+        });
+
+      if (error) {
+        return json(res, 500, { ok: false, error: `plans insert: ${error.message}` });
+      }
+      return json(res, 200, { ok: true, source: 'hyperstack', plan });
+    }
+
+    // 2) Ostali eventi – za sada samo potvrdi prijem
+    if (table === 'daily_logs' || table === 'sensor_events') {
+      return json(res, 200, { ok: true, received: { table, op } });
+    }
+
+    return json(res, 200, { ok: true, note: `No-op for table ${table}` });
+  } catch (e: any) {
+    console.error('run-humai error:', e);
+    return json(res, 500, { ok: false, error: String(e?.message || e) });
   }
 }
