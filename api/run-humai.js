@@ -1,155 +1,54 @@
-// api/run-humai.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { createClient } from '@supabase/supabase-js';
+export const config = { runtime: 'edge' };
 
-/** ---- Env guard ---- */
-const {
-  NEXT_PUBLIC_SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  EDGE_SHARED_SECRET,
-  HYPERSTACK_API_KEY,
-  HYPERSTACK_MODEL,
-} = process.env;
+type Payload = {
+  table: string;
+  op: 'INSERT' | 'UPDATE' | 'DELETE';
+  row: Record<string, unknown>;
+};
 
-function missing(...keys: string[]) {
-  const miss = keys.filter((k) => !(process.env as any)[k]);
-  return miss.length ? miss : null;
-}
-
-const miss = missing(
-  'NEXT_PUBLIC_SUPABASE_URL',
-  'SUPABASE_SERVICE_ROLE_KEY',
-  'EDGE_SHARED_SECRET',
-  'HYPERSTACK_API_KEY',
-  'HYPERSTACK_MODEL'
-);
-if (miss) {
-  // Log u build/runtime; korisniku vraćamo 500 kasnije.
-  console.error('Missing env:', miss.join(', '));
-}
-
-/** ---- Supabase (service role) ---- */
-const supabase = createClient(NEXT_PUBLIC_SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!, {
-  auth: { persistSession: false },
-});
-
-/** ---- Helpers ---- */
-function json(res: VercelResponse, code: number, payload: any) {
-  return res.status(code).json(payload);
-}
-
-function unauthorized(res: VercelResponse, msg = 'Unauthorized') {
-  return json(res, 401, { ok: false, error: msg });
-}
-
-/** ---- Hyperstack call ---- */
-async function callHyperstack(intake: any, last_log: any, sensors: any[]) {
-  // Minimalan, striktan system prompt (model već istreniran na širi kontrakt)
-  const system = `You are HumAI. Return STRICT JSON only according to the contract already trained.`;
-  const user = JSON.stringify({ intake, last_log, sensors });
-
-  const resp = await fetch('https://console.hyperstack.cloud/ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${HYPERSTACK_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: HYPERSTACK_MODEL,
-      stream: false,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    }),
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
   });
-
-  const raw = await resp.text();
-  try {
-    const parsed = JSON.parse(raw);
-    // Ako Hyperstack vrati direktno JSON plana (kako si testirao u Playgroundu)
-    // parsed je već naš plan objekt. U nekim slučajevima API vraća {choices:[{message:{content:"<json>"}}]}
-    if (parsed?.choices?.[0]?.message?.content) {
-      return JSON.parse(parsed.choices[0].message.content);
-    }
-    return parsed;
-  } catch (e) {
-    throw new Error(`Hyperstack parse error: ${raw.slice(0, 400)}`);
-  }
 }
 
-/** ---- Main handler ---- */
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Health-check / GET
-  if (req.method === 'GET') {
-    return json(res, 200, { ok: true, service: 'humai-runner', time: new Date().toISOString() });
-  }
-
-  if (req.method !== 'POST') {
-    return json(res, 405, { ok: false, error: 'Method Not Allowed' });
-  }
-
-  if (miss) {
-    return json(res, 500, { ok: false, error: `Missing env: ${miss.join(', ')}` });
-  }
-
-  // Bearer auth (EDGE_SHARED_SECRET)
-  const auth = req.headers['authorization'] || req.headers['Authorization'];
-  if (!auth || typeof auth !== 'string' || !auth.startsWith('Bearer ')) {
-    return unauthorized(res, 'Missing Bearer token');
-  }
-  const token = auth.slice('Bearer '.length).trim();
-  if (token !== EDGE_SHARED_SECRET) {
-    return unauthorized(res, 'Invalid secret');
-  }
-
-  // Parse body (Postman / Supabase webhook šalju JSON)
-  let body: any;
+export default async function handler(req: Request): Promise<Response> {
   try {
-    body = typeof req.body === 'object' ? req.body : JSON.parse(req.body || '{}');
-  } catch {
-    return json(res, 400, { ok: false, error: 'Bad JSON body' });
-  }
+    const auth = req.headers.get('authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+    const shared = process.env.EDGE_SHARED_SECRET || '';
 
-  const { table, op, row } = body || {};
-  if (!table || !op || !row) {
-    return json(res, 400, { ok: false, error: 'Expected {table, op, row}' });
-  }
+    if (!shared) return json(500, { ok: false, error: 'Missing env: EDGE_SHARED_SECRET' });
+    if (token !== shared) return json(401, { ok: false, error: 'Unauthorized' });
 
-  try {
-    // 1) Intake event -> generiši plan preko Hyperstack-a
-    if (table === 'intake_forms' && String(op).toUpperCase() === 'INSERT') {
-      const user_id = row.user_id;
-      const intake = row.payload || {};
-      const last_log = {}; // možeš dopuniti čitanjem iz Supabase ako želiš
-      const sensors: any[] = []; // isto
+    if (req.method === 'GET') return json(200, { ok: true, service: 'humai-runner' });
+    if (req.method !== 'POST') return json(405, { ok: false, error: 'Method Not Allowed' });
 
-      const plan = await callHyperstack(intake, last_log, sensors);
+    let data: Payload | null = null;
+    try { data = (await req.json()) as Payload; }
+    catch { return json(400, { ok: false, error: 'Invalid JSON' }); }
 
-      // Očekuje se JSON sa ključevima: plan_date, daily_plan, training_recs, nutrition_plan, effort_status
-      // Upis u public.plans (payload = cijeli plan)
-      const { error } = await supabase
-        .from('plans')
-        .insert({
-          user_id,
-          plan_date: plan.plan_date, // YYYY-MM-DD
-          payload: plan,             // full JSON
-        });
+    const hsKey = process.env.HYPERSTACK_API_KEY || '';
+    const hsModel = process.env.HYPERSTACK_MODEL || 'BPM_HumAI_Absolute_wF';
+    if (!hsKey) return json(500, { ok: false, error: 'Missing env: HYPERSTACK_API_KEY' });
 
-      if (error) {
-        return json(res, 500, { ok: false, error: `plans insert: ${error.message}` });
-      }
-      return json(res, 200, { ok: true, source: 'hyperstack', plan });
-    }
+    const hsResp = await fetch('https://console.hyperstack.cloud/ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${hsKey}` },
+      body: JSON.stringify({
+        model: hsModel,
+        messages: [
+          { role: 'system', content: 'Return STRICT JSON per your contract.' },
+          { role: 'user', content: JSON.stringify({ intake: data?.row ?? {}, last_log: {}, sensors: [] }) }
+        ],
+        stream: false
+      })
+    });
 
-    // 2) Ostali eventi – za sada samo potvrdi prijem
-    if (table === 'daily_logs' || table === 'sensor_events') {
-      return json(res, 200, { ok: true, received: { table, op } });
-    }
-
-    return json(res, 200, { ok: true, note: `No-op for table ${table}` });
+    const text = await hsResp.text();
+    return json(200, { ok: true, source: 'hyperstack', result: text });
   } catch (e: any) {
-    console.error('run-humai error:', e);
-    return json(res, 500, { ok: false, error: String(e?.message || e) });
+    return json(500, { ok: false, error: e?.message || 'Internal Error' });
   }
 }
